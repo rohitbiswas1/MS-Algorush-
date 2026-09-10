@@ -17,10 +17,12 @@ from leetcode import (
 from ai_coach import (
     analyze_with_gemini,
     extract_sections,
-    get_gemini_client,
+    _generate_with_gemini,
+    _format_gemini_error,
+    MODEL,
 )
 
-app = FastAPI(title="LeetCode AI Coach")
+app = FastAPI(title="LeetMind")
 
 
 # =========================================================
@@ -102,7 +104,6 @@ async def get_analysis(body: UsernameRequest):
             }
 
         history = load_history(username)
-
         progress = calculate_progress(history)
 
         ai_response = analyze_with_gemini(
@@ -116,15 +117,9 @@ async def get_analysis(body: UsernameRequest):
         return {
             "analysis": sections["analysis"],
             "weak_areas": sections["weak_areas"],
-            "next_action": sections.get(
-                "next_action",
-                ""
-            ),
+            "next_action": sections.get("next_action", ""),
             "practice_plan": sections["practice_plan"],
-            "motivation": sections.get(
-                "motivation",
-                ""
-            ),
+            "motivation": sections.get("motivation", ""),
             "raw": sections["raw"],
         }
 
@@ -140,7 +135,6 @@ async def get_analysis(body: UsernameRequest):
 
 @app.post("/api/chat")
 async def chat(body: ChatRequest):
-
     message = body.message.strip()
 
     if not message:
@@ -149,25 +143,15 @@ async def chat(body: ChatRequest):
         }
 
     try:
-        client = get_gemini_client()
-
         history_text = ""
 
-        # Keep only the last 10 messages
+        # Keep only the last 10 messages.
         for item in body.history[-10:]:
-
-            role = (
-                "User"
-                if item.role.lower() == "user"
-                else "Assistant"
-            )
-
-            history_text += (
-                f"{role}: {item.content}\n"
-            )
+            role = "User" if item.role.lower() == "user" else "Assistant"
+            history_text += f"{role}: {item.content}\n"
 
         prompt = f"""
-You are the LeetCode AI Coach.
+You are the LeetMind AI Coach.
 
 You specialize in:
 - DSA
@@ -189,10 +173,10 @@ User:
 Answer the user directly.
 """
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt
-        )
+        # IMPORTANT: create and close a Gemini client for this request.
+        # This prevents the "client has been closed" error caused by a stale
+        # underlying HTTP transport in serverless environments.
+        response = _generate_with_gemini(prompt)
 
         if not response or not response.text:
             return {
@@ -204,23 +188,8 @@ Answer the user directly.
         }
 
     except Exception as e:
-
-        error_text = str(e)
-
-        if (
-            "API_KEY_INVALID" in error_text
-            or "API key not valid" in error_text
-        ):
-            return {
-                "reply": (
-                    "Gemini API key is invalid. "
-                    "Please update your GEMINI_API_KEY "
-                    "in the .env file."
-                )
-            }
-
         return {
-            "reply": f"Gemini error: {error_text}"
+            "reply": _format_gemini_error(e)
         }
 
 
@@ -247,7 +216,6 @@ async def root():
 # =========================================================
 
 if __name__ == "__main__":
-
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
