@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from google import genai
 
 
-MODEL = "gemini-2.5-flash-lite"
+MODEL = "gemini-3.6-flash"
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
@@ -67,7 +67,7 @@ Keep the advice encouraging, honest, and practical.
 def _format_gemini_error(error: Exception) -> str:
     error_text = str(error)
     if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
-        return "Gemini API key is invalid. Replace GEMINI_API_KEY in .env and restart the server."
+        return "Gemini API key is invalid. Replace GEMINI_API_KEY in .env or Vercel Environment Variables and restart/redeploy the app."
     return f"Gemini error: {error_text}"
 
 
