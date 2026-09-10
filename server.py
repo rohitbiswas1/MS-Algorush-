@@ -1,3 +1,5 @@
+import os
+import re
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -19,7 +21,6 @@ from ai_coach import (
     extract_sections,
     _generate_with_gemini,
     _format_gemini_error,
-    MODEL,
 )
 
 app = FastAPI(title="LeetMind")
@@ -44,6 +45,22 @@ class ChatRequest(BaseModel):
 
 
 # =========================================================
+# HISTORY HELPERS
+# =========================================================
+
+def history_path(username: str) -> str:
+    """Return a safe per-user history file path.
+
+    Vercel only allows writes under /tmp, while local development uses the
+    project directory. Keeping history per username prevents one user's
+    snapshots from overwriting another user's progress.
+    """
+    safe_username = re.sub(r"[^a-zA-Z0-9_-]", "_", username.lower())[:80]
+    base_dir = "/tmp" if os.getenv("VERCEL") else "."
+    return os.path.join(base_dir, f"leetmind_{safe_username}.json")
+
+
+# =========================================================
 # API: STATS
 # =========================================================
 
@@ -52,22 +69,17 @@ async def get_stats(body: UsernameRequest):
     username = body.username.strip()
 
     if not username:
-        return {
-            "error": "Username is required"
-        }
+        return {"error": "Username is required"}
 
     try:
         stats = fetch_leetcode_stats(username)
 
         if not stats:
-            return {
-                "error": f"User '{username}' not found on LeetCode"
-            }
+            return {"error": f"User '{username}' not found on LeetCode"}
 
-        save_daily_snapshot(stats)
-
-        history = load_history(username)
-
+        filepath = history_path(username)
+        save_daily_snapshot(stats, filepath)
+        history = load_history(filepath)
         progress = calculate_progress(history)
 
         return {
@@ -77,9 +89,7 @@ async def get_stats(body: UsernameRequest):
         }
 
     except Exception as e:
-        return {
-            "error": f"Failed to fetch stats: {str(e)}"
-        }
+        return {"error": f"Failed to fetch stats: {str(e)}"}
 
 
 # =========================================================
@@ -91,27 +101,25 @@ async def get_analysis(body: UsernameRequest):
     username = body.username.strip()
 
     if not username:
-        return {
-            "error": "Username is required"
-        }
+        return {"error": "Username is required"}
 
     try:
         stats = fetch_leetcode_stats(username)
 
         if not stats:
-            return {
-                "error": f"User '{username}' not found on LeetCode"
-            }
+            return {"error": f"User '{username}' not found on LeetCode"}
 
-        history = load_history(username)
+        filepath = history_path(username)
+        history = load_history(filepath)
         progress = calculate_progress(history)
 
-        ai_response = analyze_with_gemini(
-            stats,
-            history,
-            progress
-        )
+        # Keep analysis history current even when the user goes straight to
+        # the AI analysis endpoint without pressing the stats button first.
+        save_daily_snapshot(stats, filepath)
+        history = load_history(filepath)
+        progress = calculate_progress(history)
 
+        ai_response = analyze_with_gemini(stats, history, progress)
         sections = extract_sections(ai_response)
 
         return {
@@ -124,9 +132,7 @@ async def get_analysis(body: UsernameRequest):
         }
 
     except Exception as e:
-        return {
-            "error": f"Gemini analysis failed: {str(e)}"
-        }
+        return {"error": f"Gemini analysis failed: {str(e)}"}
 
 
 # =========================================================
@@ -138,14 +144,12 @@ async def chat(body: ChatRequest):
     message = body.message.strip()
 
     if not message:
-        return {
-            "reply": "Please enter a message."
-        }
+        return {"reply": "Please enter a message."}
 
     try:
         history_text = ""
 
-        # Keep only the last 10 messages.
+        # Keep only the last 10 messages to control prompt size.
         for item in body.history[-10:]:
             role = "User" if item.role.lower() == "user" else "Assistant"
             history_text += f"{role}: {item.content}\n"
@@ -162,7 +166,8 @@ You specialize in:
 - Coding interview preparation
 - Time and space complexity
 
-Be concise, clear, practical, and friendly.
+Be concise, clear, practical, and friendly. Do not claim to have access to
+private LeetCode account information unless the user provides it.
 
 Conversation so far:
 {history_text}
@@ -173,24 +178,15 @@ User:
 Answer the user directly.
 """
 
-        # IMPORTANT: create and close a Gemini client for this request.
-        # This prevents the "client has been closed" error caused by a stale
-        # underlying HTTP transport in serverless environments.
         response = _generate_with_gemini(prompt)
 
         if not response or not response.text:
-            return {
-                "reply": "Gemini returned an empty response."
-            }
+            return {"reply": "Gemini returned an empty response."}
 
-        return {
-            "reply": response.text
-        }
+        return {"reply": response.text}
 
     except Exception as e:
-        return {
-            "reply": _format_gemini_error(e)
-        }
+        return {"reply": _format_gemini_error(e)}
 
 
 # =========================================================
@@ -200,15 +196,13 @@ Answer the user directly.
 app.mount(
     "/static",
     StaticFiles(directory="static"),
-    name="static"
+    name="static",
 )
 
 
 @app.get("/")
 async def root():
-    return FileResponse(
-        "static/index.html"
-    )
+    return FileResponse("static/index.html")
 
 
 # =========================================================
@@ -220,5 +214,5 @@ if __name__ == "__main__":
         "server:app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=True,
     )
