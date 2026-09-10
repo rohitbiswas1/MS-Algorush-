@@ -5,17 +5,42 @@ from dotenv import load_dotenv
 from google import genai
 
 
-MODEL = "gemini-3.6-flash"
+# Current Gemini Flash model documented by Google.
+MODEL = "gemini-3.7-flash"
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
-def get_gemini_client() -> genai.Client:
+def _get_api_key() -> str:
     api_key = (os.getenv("GEMINI_API_KEY") or "").strip().strip('"\'')
     if not api_key:
         raise ValueError(
             "GEMINI_API_KEY is missing. Add a valid key to the project's .env file."
         )
-    return genai.Client(api_key=api_key)
+    return api_key
+
+
+def get_gemini_client() -> genai.Client:
+    """Create a fresh Gemini client.
+
+    Callers that use this compatibility helper should close the returned client
+    after the request. New request code should prefer _generate_with_gemini().
+    """
+    return genai.Client(api_key=_get_api_key())
+
+
+def _generate_with_gemini(contents: str):
+    """Generate one response with a request-scoped client.
+
+    The google-genai SDK uses an underlying HTTP client. In serverless/FastAPI
+    environments, reusing a client after its transport has been cleaned up can
+    produce: "Cannot send a request, as the client has been closed."
+    A context-managed client guarantees the request finishes before cleanup.
+    """
+    with genai.Client(api_key=_get_api_key()) as client:
+        return client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+        )
 
 
 def build_prompt(stats: dict, history: list[dict], progress: dict) -> str:
@@ -68,14 +93,15 @@ def _format_gemini_error(error: Exception) -> str:
     error_text = str(error)
     if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
         return "Gemini API key is invalid. Replace GEMINI_API_KEY in .env or Vercel Environment Variables and restart/redeploy the app."
+    if "client has been closed" in error_text.lower():
+        return "Gemini connection was closed before the request completed. Please retry; the app now uses a request-scoped Gemini client."
     return f"Gemini error: {error_text}"
 
 
 def analyze_with_gemini(stats: dict, history: list[dict], progress: dict) -> str:
     try:
-        response = get_gemini_client().models.generate_content(
-            model=MODEL,
-            contents=build_prompt(stats, history, progress),
+        response = _generate_with_gemini(
+            build_prompt(stats, history, progress)
         )
         return response.text or "Gemini returned an empty response."
     except Exception as error:
@@ -88,7 +114,7 @@ def ask_coach(question: str, stats: dict, history: list[dict]) -> str:
         for item in history[-10:]
     )
     prompt = f"""
-You are the LeetCode AI Coach. Give concise, clear, practical help with DSA,
+You are the LeetMind AI Coach. Give concise, clear, practical help with DSA,
 algorithms, LeetCode, competitive programming, and coding interviews.
 
 Student profile: {stats}
@@ -99,10 +125,7 @@ User question: {question}
 Answer directly and include complexity when relevant.
 """
     try:
-        response = get_gemini_client().models.generate_content(
-            model=MODEL,
-            contents=prompt,
-        )
+        response = _generate_with_gemini(prompt)
         return response.text or "Gemini returned an empty response."
     except Exception as error:
         return _format_gemini_error(error)
