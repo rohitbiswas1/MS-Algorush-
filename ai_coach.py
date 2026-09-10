@@ -1,12 +1,16 @@
 import os
+import random
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
 
 
-# Current Gemini Flash model documented by Google.
-MODEL = "gemini-3.7-flash"
+MODEL = "gemini-3.6-flash"
+FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-2.5-flash"]
+MAX_ATTEMPTS_PER_MODEL = 2
+
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
@@ -20,27 +24,42 @@ def _get_api_key() -> str:
 
 
 def get_gemini_client() -> genai.Client:
-    """Create a fresh Gemini client.
-
-    Callers that use this compatibility helper should close the returned client
-    after the request. New request code should prefer _generate_with_gemini().
-    """
     return genai.Client(api_key=_get_api_key())
 
 
-def _generate_with_gemini(contents: str):
-    """Generate one response with a request-scoped client.
+def _is_transient_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in (
+        "503", "unavailable", "high demand", "temporarily overloaded",
+        "429", "resource_exhausted", "rate limit", "too many requests",
+    ))
 
-    The google-genai SDK uses an underlying HTTP client. In serverless/FastAPI
-    environments, reusing a client after its transport has been cleaned up can
-    produce: "Cannot send a request, as the client has been closed."
-    A context-managed client guarantees the request finishes before cleanup.
-    """
-    with genai.Client(api_key=_get_api_key()) as client:
-        return client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-        )
+
+def _generate_with_gemini(contents: str):
+    """Generate with exponential backoff and fallback Gemini models."""
+    models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    last_error = None
+
+    for model_index, model in enumerate(models):
+        for attempt in range(MAX_ATTEMPTS_PER_MODEL):
+            try:
+                # Request-scoped client prevents stale/closed HTTP transports.
+                with genai.Client(api_key=_get_api_key()) as client:
+                    return client.models.generate_content(
+                        model=model,
+                        contents=contents,
+                    )
+            except Exception as error:
+                last_error = error
+                if not _is_transient_error(error):
+                    raise
+                delay = min(2 ** attempt, 4) + random.uniform(0, 0.5)
+                time.sleep(delay)
+
+        if model_index < len(models) - 1:
+            time.sleep(0.5)
+
+    raise last_error or RuntimeError("Gemini request failed.")
 
 
 def build_prompt(stats: dict, history: list[dict], progress: dict) -> str:
@@ -91,18 +110,21 @@ Keep the advice encouraging, honest, and practical.
 
 def _format_gemini_error(error: Exception) -> str:
     error_text = str(error)
-    if "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
+    lower = error_text.lower()
+    if "api_key_invalid" in lower or "api key not valid" in lower:
         return "Gemini API key is invalid. Replace GEMINI_API_KEY in .env or Vercel Environment Variables and restart/redeploy the app."
-    if "client has been closed" in error_text.lower():
-        return "Gemini connection was closed before the request completed. Please retry; the app now uses a request-scoped Gemini client."
+    if "client has been closed" in lower:
+        return "Gemini connection was closed before the request completed. Please retry; LeetMind now uses a request-scoped client."
+    if "503" in lower or "unavailable" in lower or "high demand" in lower:
+        return "Gemini is temporarily busy. LeetMind automatically retries and switches to a fallback Gemini model. Please try again in a few seconds."
+    if "429" in lower or "resource_exhausted" in lower or "rate limit" in lower:
+        return "Gemini rate limit reached. LeetMind automatically retries with backoff and a fallback model. Please try again shortly."
     return f"Gemini error: {error_text}"
 
 
 def analyze_with_gemini(stats: dict, history: list[dict], progress: dict) -> str:
     try:
-        response = _generate_with_gemini(
-            build_prompt(stats, history, progress)
-        )
+        response = _generate_with_gemini(build_prompt(stats, history, progress))
         return response.text or "Gemini returned an empty response."
     except Exception as error:
         return _format_gemini_error(error)
